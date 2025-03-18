@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+selenium
+webdriver-manager
+langchain
+langchain-community
+langchain-core
+python-dotenv
