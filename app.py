@@ -16,16 +16,31 @@ from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from langchain.indexes import VectorstoreIndexCreator
-from langchain.document_loaders import DataFrameLoader
-from langchain.chat_models import ChatOpenAI
+from langchain_community.document_loaders import DataFrameLoader
 from langchain.chains import ConversationalRetrievalChain
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_groq import ChatGroq
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 import io
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
+
+# Check if GROQ_API_KEY is in environment variables
+groq_api_key = os.getenv("GROQ_API_KEY")
+print(f"GROQ_API_KEY: {groq_api_key}")
+
+# Initialize session state to store dataframes between tabs
+if 'df_successful' not in st.session_state:
+    st.session_state.df_successful = pd.DataFrame()
+    print("Initialized empty df_successful in session state")
+if 'df_failed' not in st.session_state:
+    st.session_state.df_failed = pd.DataFrame()
+    print("Initialized empty df_failed in session state")
 
 st.set_page_config(page_title="UoM Result Scraper", page_icon="📊", layout="wide")
 
@@ -298,34 +313,88 @@ def scrape_result(driver, reg_no, dob, max_retries=3):
                 # Try different methods to find student name
                 name_element = None
                 name_selectors = [
-                    "//td[normalize-space()='Name']/following-sibling::td",
-                    "//th[normalize-space()='Name']/following-sibling::td",
-                    "//label[normalize-space()='Name']/following-sibling::*",
-                    "//div[normalize-space()='Name']/following-sibling::*",
-                    "//td[normalize-space()='Candidate']/following-sibling::td"
+                    "//td[contains(text(), 'Name') or contains(text(), 'NAME') or contains(text(), 'name')]/following-sibling::td",
+                    "//th[contains(text(), 'Name') or contains(text(), 'NAME') or contains(text(), 'name')]/following-sibling::td", 
+                    "//tr[contains(.,'Name') or contains(.,'NAME') or contains(.,'name')]/td[2]",
+                    "//label[contains(text(), 'Name') or contains(text(), 'NAME') or contains(text(), 'name')]/following-sibling::*",
+                    "//div[contains(text(), 'Name') or contains(text(), 'NAME') or contains(text(), 'name')]/following-sibling::*",
+                    "//td[contains(text(), 'Candidate') or contains(text(), 'CANDIDATE')]/following-sibling::td"
                 ]
                 
+                # First attempt with exact selectors
                 for selector in name_selectors:
                     try:
                         elements = driver.find_elements(By.XPATH, selector)
                         if elements:
-                            name_element = elements[0]
-                            break
+                            for element in elements:
+                                text = element.text.strip()
+                                # Filter out common institution names or empty values
+                                if (text and 
+                                    len(text) > 3 and 
+                                    "university" not in text.lower() and 
+                                    "madras" not in text.lower() and
+                                    "institution" not in text.lower() and
+                                    "college" not in text.lower()):
+                                    name_element = element
+                                    break
+                            if name_element:
+                                break
                     except:
                         continue
                 
+                # If still not found, try looking for the typical positioning of names in result pages
+                if not name_element:
+                    try:
+                        # Try to find tables with potential student info
+                        tables = driver.find_elements(By.TAG_NAME, "table")
+                        for table in tables:
+                            rows = table.find_elements(By.TAG_NAME, "tr")
+                            for row in rows:
+                                cells = row.find_elements(By.TAG_NAME, "td")
+                                if len(cells) >= 2:
+                                    # Check if first cell contains something like "Name" or "Student"
+                                    first_cell = cells[0].text.lower().strip()
+                                    if "name" in first_cell or "student" in first_cell or "candidate" in first_cell:
+                                        second_cell = cells[1].text.strip()
+                                        if (second_cell and 
+                                            "university" not in second_cell.lower() and 
+                                            "madras" not in second_cell.lower() and
+                                            len(second_cell) > 3):
+                                            name_element = cells[1]
+                                            break
+                            if name_element:
+                                break
+                    except:
+                        pass
+                
+                # If name element found, extract text
                 if name_element:
-                    results["Student Name"] = name_element.text.strip()
+                    student_name = name_element.text.strip()
+                    # Final verification - if the name looks valid, use it
+                    if (student_name and 
+                        "university" not in student_name.lower() and 
+                        "madras" not in student_name.lower() and
+                        len(student_name) > 3):
+                        results["Student Name"] = student_name
+                    else:
+                        results["Student Name"] = "Name extraction failed"
                 else:
                     # Alternative method: look for elements with certain formatting
                     bold_elements = driver.find_elements(By.XPATH, "//b | //strong")
                     for element in bold_elements:
                         text = element.text.strip()
-                        if len(text) > 5 and ":" not in text and text.upper() != text:  # Likely a name
+                        if (len(text) > 3 and 
+                            ":" not in text and 
+                            "university" not in text.lower() and 
+                            "madras" not in text.lower() and
+                            text.upper() != text):  # Likely a name
                             results["Student Name"] = text
                             break
-            except:
+                    else:
+                        results["Student Name"] = "Name extraction failed"
+            except Exception as e:
                 results["Student Name"] = "Name extraction failed"
+                print(f"Error extracting name: {str(e)}")
             
             # Find subject data (codes, names, marks)
             subject_results = {}
@@ -688,11 +757,11 @@ with tab1:
                 
                 # Process the results for export
                 st.subheader("Results Summary")
-                df_successful, df_failed = process_results_for_export(all_results)
+                st.session_state.df_successful, st.session_state.df_failed = process_results_for_export(all_results)
                 
-                if not df_successful.empty:
+                if not st.session_state.df_successful.empty:
                     # Format the dataframe for better display
-                    display_df = df_successful.copy()
+                    display_df = st.session_state.df_successful.copy()
                     
                     # Rename columns to make them more readable
                     column_renames = {}
@@ -726,9 +795,9 @@ with tab1:
                     # Export to Excel
                     excel_data = io.BytesIO()
                     with pd.ExcelWriter(excel_data, engine="openpyxl") as writer:
-                        df_successful.to_excel(writer, sheet_name="Successful Results", index=False)
-                        if not df_failed.empty:
-                            df_failed.to_excel(writer, sheet_name="Failed Results", index=False)
+                        st.session_state.df_successful.to_excel(writer, sheet_name="Successful Results", index=False)
+                        if not st.session_state.df_failed.empty:
+                            st.session_state.df_failed.to_excel(writer, sheet_name="Failed Results", index=False)
                     
                     excel_data.seek(0)
                     st.download_button(
@@ -739,9 +808,9 @@ with tab1:
                     )
                 else:
                     st.error("No successful results to display.")
-                    if not df_failed.empty:
+                    if not st.session_state.df_failed.empty:
                         st.write("Failed Results:")
-                        st.dataframe(df_failed)
+                        st.dataframe(st.session_state.df_failed)
                 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
@@ -752,63 +821,111 @@ with tab2:
     st.header("Query Your Results")
     st.write("After scraping results, you can ask questions about the data here.")
     
+    # Add debug information about session state
+    st.write(f"**Debug Info:** Data available in session state: {not st.session_state.df_successful.empty}")
+    if not st.session_state.df_successful.empty:
+        st.write(f"DataFrame shape: {st.session_state.df_successful.shape}")
+    
+    # Add option to upload previously exported results
+    st.subheader("Load Previously Exported Results")
+    st.write("If you've already scraped and exported results, you can upload the Excel file here:")
+    uploaded_results = st.file_uploader("Upload previous results", type=["xlsx"])
+    
+    if uploaded_results is not None:
+        try:
+            # Load the uploaded Excel file
+            xls = pd.ExcelFile(uploaded_results)
+            sheet_names = xls.sheet_names
+            
+            if "Successful Results" in sheet_names:
+                st.session_state.df_successful = pd.read_excel(uploaded_results, sheet_name="Successful Results")
+                st.success(f"Successfully loaded {len(st.session_state.df_successful)} records from the uploaded file.")
+                
+                if "Failed Results" in sheet_names:
+                    st.session_state.df_failed = pd.read_excel(uploaded_results, sheet_name="Failed Results")
+            else:
+                # If sheet names don't match expected format, try to load the first sheet
+                st.session_state.df_successful = pd.read_excel(uploaded_results)
+                st.success(f"Successfully loaded {len(st.session_state.df_successful)} records from the uploaded file.")
+        except Exception as e:
+            st.error(f"Error loading the Excel file: {str(e)}")
+    
     # Example questions
     st.info("Example questions you can ask:\n" +
             "- Which student has the highest marks?\n" +
             "- How many students passed all subjects?\n" +
             "- What is the average grade for a specific subject?")
     
+    # Allow the user to enter an API key directly if not found in environment variables
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        st.warning("Groq API key not found in environment variables.")
+        api_key = st.text_input("Enter your Groq API key", type="password")
+        if api_key:
+            st.success("API key entered successfully!")
+    
     # Q&A functionality
     question = st.text_input("Ask a question about the result data")
     
-    if question:
-        # Check if there's an API key
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("OpenAI API key not found. Please add it to your .env file.")
-            st.info("Create a file named .env with the content: OPENAI_API_KEY=your_api_key_here")
+    if question and api_key:
+        # Check if we have result data in memory
+        if not st.session_state.df_successful.empty:
+            try:
+                with st.spinner("Thinking..."):
+                    # Get the dataframe data as a string
+                    df_sample = st.session_state.df_successful.head(20)  # Limit to 20 rows for performance
+                    df_string = df_sample.to_string()
+                    
+                    # Create a prompt template
+                    prompt_template = """
+                    You are an AI assistant helping to analyze student results data.
+                    
+                    Here is a sample of the data (limited to 20 rows for brevity):
+                    {df_string}
+                    
+                    The user asks: {question}
+                    
+                    Please provide a detailed and accurate answer based on this data.
+                    If the information is not available in the data, please state that clearly.
+                    """
+                    
+                    prompt = PromptTemplate(
+                        template=prompt_template,
+                        input_variables=["df_string", "question"]
+                    )
+                    
+                    # Create Groq chat object
+                    llm = ChatGroq(
+                        temperature=0, 
+                        groq_api_key=api_key,
+                        model_name="llama3-70b-8192"  # Use an appropriate Groq model
+                    )
+                    
+                    # Create the chain
+                    chain = LLMChain(llm=llm, prompt=prompt)
+                    
+                    # Process the question
+                    response = chain.run({
+                        "df_string": df_string,
+                        "question": question
+                    })
+                    
+                    # Display the answer
+                    st.write("### Answer")
+                    st.write(response)
+                    
+                    # Display data source info
+                    st.write("### Data Source")
+                    st.write("Answer based on the student results data sample:")
+                    st.dataframe(df_sample)
+            
+            except Exception as e:
+                st.error(f"Error processing question: {str(e)}")
+                st.error(traceback.format_exc())
         else:
-            # Check if we have result data in memory
-            if 'df_successful' in locals() and not df_successful.empty:
-                try:
-                    with st.spinner("Thinking..."):
-                        # Process the question using LangChain
-                        # Create vector store from DataFrame
-                        documents = DataFrameLoader(df_successful).load()
-                        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-                        docs = text_splitter.split_documents(documents)
-                        
-                        # Initialize embeddings and retrieval QA
-                        embeddings = OpenAIEmbeddings()
-                        vectorstore = FAISS.from_documents(docs, embeddings)
-                        
-                        # Create ChatOpenAI object
-                        llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
-                        
-                        # Create conversation chain
-                        qa = ConversationalRetrievalChain.from_llm(
-                            llm,
-                            vectorstore.as_retriever(),
-                            return_source_documents=True
-                        )
-                        
-                        # Process the question
-                        result = qa({"question": question, "chat_history": []})
-                        
-                        # Display the answer
-                        st.write("### Answer")
-                        st.write(result["answer"])
-                        
-                        # Display source info
-                        st.write("### Sources")
-                        for doc in result["source_documents"]:
-                            st.info(doc.page_content)
-                
-                except Exception as e:
-                    st.error(f"Error processing question: {str(e)}")
-                    st.error(traceback.format_exc())
-            else:
-                st.warning("No result data available. Please scrape some results first.")
+            st.warning("No result data available. Please scrape some results first.")
+    elif question and not api_key:
+        st.error("Please provide a valid Groq API key to use the Q&A functionality.")
 
 # Display instructions
 with st.expander("Instructions"):
@@ -830,7 +947,7 @@ with st.expander("Instructions"):
     
     5. Once completed, you can:
        - Download the results as an Excel file
-       - Ask questions about the data (requires OpenAI API key)
+       - Ask questions about the data (requires Groq API key)
        
     ## Sample Questions to Ask:
     
