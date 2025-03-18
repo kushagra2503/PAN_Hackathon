@@ -12,7 +12,7 @@ A Streamlit web application that automates the process of fetching student resul
 
 ## Installation
 
-1. Clone this repository
+1. Clone this repository using ```git clone https://github.com/kushagra2503/PAN_Hackathon/```
 2. Install the required dependencies:
 
 ```
